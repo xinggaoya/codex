@@ -1320,6 +1320,126 @@ impl ModelClientSession {
         }
     }
 
+    /// Streams a turn via the Chat Completions API (HTTP SSE).
+    ///
+    /// This path is used when `wire_api = "chat"` for third-party providers
+    /// that only support the `/v1/chat/completions` endpoint.
+    #[instrument(
+        name = "model_client.stream_chat_completions_api",
+        level = "info",
+        skip_all,
+        fields(
+            model = %model_info.slug,
+            wire_api = "chat",
+            transport = "chat_completions_http",
+            api.path = "chat/completions"
+        )
+    )]
+    async fn stream_chat_completions_api(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        turn_metadata_header: Option<&str>,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        let auth_manager = self.client.state.provider.auth_manager();
+        let mut auth_recovery = auth_manager
+            .as_ref()
+            .map(AuthManager::unauthorized_recovery);
+        let mut pending_retry = PendingUnauthorizedRetry::default();
+        loop {
+            let client_setup = self.client.current_client_setup().await?;
+            let transport = ReqwestTransport::new(build_reqwest_client());
+            let request_auth_context = AuthRequestTelemetryContext::new(
+                client_setup.auth.as_ref().map(CodexAuth::auth_mode),
+                client_setup.api_auth.as_ref(),
+                pending_retry,
+            );
+            let (request_telemetry, sse_telemetry) = Self::build_streaming_telemetry(
+                session_telemetry,
+                request_auth_context,
+                RequestRouteTelemetry::for_endpoint("chat/completions"),
+                self.client.state.auth_env_telemetry.clone(),
+            );
+
+            let tools_json = create_tools_json_for_responses_api(&prompt.tools)?;
+            let chat_tools = codex_api::responses_tool_json_to_chat_tools(&tools_json);
+            // Debug: try without tools to see if MiniMax supports basic chat
+            let chat_tools_for_request = vec![];
+            let request = codex_api::build_chat_completions_request(
+                &model_info.slug,
+                &prompt.base_instructions.text,
+                &prompt.input,
+                chat_tools_for_request,
+                /*stream*/ true,
+            );
+
+            let mut extra_headers = ApiHeaderMap::new();
+            if let Some(ref turn_metadata) = turn_metadata_header {
+                if let Ok(val) = HeaderValue::from_str(turn_metadata) {
+                    extra_headers.insert("x-codex-turn-metadata", val);
+                }
+            }
+
+            let inference_trace_attempt = inference_trace.start_attempt();
+            let options = codex_api::ChatCompletionsOptions {
+                extra_headers,
+                compression: Compression::None,
+                turn_state: None,
+            };
+            let client = codex_api::ChatCompletionsClient::new(
+                transport,
+                client_setup.api_provider,
+                client_setup.api_auth,
+            )
+            .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            let stream_result = client.stream_request(request, options).await;
+
+            match stream_result {
+                Ok(stream) => {
+                    let (stream, _) = map_response_stream(
+                        stream,
+                        session_telemetry.clone(),
+                        inference_trace_attempt,
+                    );
+                    return Ok(stream);
+                }
+                Err(ApiError::Transport(
+                    unauthorized_transport @ TransportError::Http { status, .. },
+                )) if status == StatusCode::UNAUTHORIZED => {
+                    let response_debug_context =
+                        extract_response_debug_context(&unauthorized_transport);
+                    inference_trace_attempt.record_failed(
+                        &unauthorized_transport,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    pending_retry = PendingUnauthorizedRetry::from_recovery(
+                        handle_unauthorized(
+                            unauthorized_transport,
+                            &mut auth_recovery,
+                            session_telemetry,
+                        )
+                        .await?,
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    let response_debug_context =
+                        extract_response_debug_context_from_api_error(&err);
+                    let err = map_api_error(err);
+                    inference_trace_attempt.record_failed(
+                        &err,
+                        response_debug_context.request_id.as_deref(),
+                        /*output_items*/ &[],
+                    );
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     /// Streams a turn via the Responses API over WebSocket transport.
     #[allow(clippy::too_many_arguments)]
     #[instrument(
@@ -1613,6 +1733,16 @@ impl ModelClientSession {
                     effort,
                     summary,
                     service_tier,
+                    turn_metadata_header,
+                    inference_trace,
+                )
+                .await
+            }
+            WireApi::Chat => {
+                self.stream_chat_completions_api(
+                    prompt,
+                    model_info,
+                    session_telemetry,
                     turn_metadata_header,
                     inference_trace,
                 )

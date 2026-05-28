@@ -309,3 +309,68 @@ impl Stream for ResponseStream {
         self.rx_event.poll_recv(cx)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Chat Completions API types
+// ---------------------------------------------------------------------------
+
+/// A message in the Chat Completions format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatMessage {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// A tool call in an assistant message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ChatFunctionCall,
+}
+
+/// The function portion of a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// A tool definition for the Chat Completions API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatToolDefinition {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ChatFunctionDefinition,
+}
+
+/// Function definition within a tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatFunctionDefinition {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: serde_json::Value,
+}
+
+/// Canonical input payload for the Chat Completions API.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCompletionsRequest {
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ChatToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
+    pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
